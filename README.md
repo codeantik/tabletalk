@@ -5,9 +5,28 @@ natural language, get back text / chart / table answers. See the full
 architecture decisions and phase plan in the project brief (not included in
 this repo).
 
-**Status:** Phase 0 complete — empty-but-correct skeleton, health-check
-round trip verified end to end. Feature work (upload, NL→SQL, chat) lands in
-later phases.
+**Status:** Phase 1 complete — CSV ingestion into session-scoped, in-memory
+DuckDB. NL→SQL and the chat UI land in later phases.
+
+## Phase 1: sessions & CSV ingestion
+
+- `POST /api/sessions` — creates a session (a fresh in-memory DuckDB
+  connection) and returns `{session_id, created_at, expires_at}`.
+- `POST /api/sessions/{session_id}/upload` — multipart upload of one or more
+  `.csv` files. Validation (extension, size limit, parseability) runs for the
+  whole batch before anything is written, so a bad file can't leave the
+  session half-updated. Column names and the table name (from the filename)
+  are normalized to `lower_snake_case` identifiers; re-uploading the same
+  filename replaces its table in place, and name collisions within one batch
+  get a numeric suffix.
+- `GET /api/sessions/{session_id}/tables` — lists every table currently
+  loaded in the session, with DuckDB-inferred column types and row counts.
+- `DELETE /api/sessions/{session_id}` — explicitly closes a session.
+
+Sessions idle for longer than `SESSION_TTL_MINUTES` are evicted lazily (on
+the next call into the session manager) rather than by a background timer —
+sufficient for a request-driven PoC, but a session won't be freed purely by
+the clock ticking if nothing else touches the manager.
 
 ## Project structure
 
@@ -78,7 +97,10 @@ limits, query timeout, CORS origin, frontend API URL).
 - **OpenAI API** — NL→SQL generation and NL response synthesis, via
   function calling for structured `{sql, intent, explanation}` output.
 
-## Known limitations (Phase 0)
+## Known limitations (Phase 1)
 
-- No feature logic yet — this is scaffolding only.
+- Sessions live in backend process memory only — a restart drops all
+  uploaded data, and there's no multi-worker/horizontal-scaling support.
+- TTL eviction is lazy (swept on next session-manager call), not proactive.
+- No NL→SQL or chat yet — those are later phases.
 - Docker path is unverified in this environment (see note above).
