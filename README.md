@@ -324,6 +324,48 @@ values so they can't masquerade as new prompt structure.
 | Extremely broad question ("tell me everything") | `apply_row_limit` caps the result regardless of how wide the generated SQL is | `test_extremely_broad_question_is_still_row_limited` |
 | Sentiment analysis / other free-text understanding | **Out of scope by design**, not approximated with a `LIKE`/keyword hack — the SQL-gen system prompt now explicitly instructs `intent: unsupported` for anything requiring understanding (not aggregation) of free-text columns, so it declines gracefully instead of generating a misleading keyword-matching query | `test_sentiment_analysis_request_declines_as_unsupported_not_a_sql_hack` |
 
+## Phase 7: Dockerization
+
+`backend/Dockerfile`, `frontend/Dockerfile`, and `docker-compose.yml` were
+written speculatively in Phase 0 (Docker was never installed in this
+environment) and re-audited here rather than re-created:
+
+- **Bug found and fixed:** neither Dockerfile had a `.dockerignore`. The
+  frontend Dockerfile's builder stage does `COPY . .` after `npm ci` —
+  without one, that copy pulls the host's `node_modules` (containing
+  platform-specific native binaries, e.g. `@next/swc`, built for the host
+  OS, not the container's Linux) and `.next` into the image, either
+  clobbering the container's own `npm ci` output or shipping binaries that
+  don't run in the container. Added `frontend/.dockerignore`
+  (`node_modules`, `.next`, `.git`, `*.tsbuildinfo`, env files) and
+  `backend/.dockerignore` (`.venv`, `__pycache__`, `tests`, `scripts`,
+  `.git`, `.env`) — the latter is a build-context-size cleanup rather than
+  a correctness fix, since the backend Dockerfile already does a scoped
+  `COPY app ./app`, not `COPY . .`.
+- **Worker count pinned explicitly:** `backend/Dockerfile`'s `CMD` now
+  passes `--workers 1` instead of relying on uvicorn's (also 1) default.
+  This is deliberate, not redundant: Phase 6 established that session
+  state (the per-session DuckDB connection + lock) lives in process
+  memory, so a second worker process would hold a disjoint copy of every
+  session and requests could land on either one, silently breaking
+  sessions. Documented inline in the Dockerfile so a future change to add
+  workers doesn't reintroduce that bug.
+- `docker-compose.yml` wiring reviewed: `env_file: .env` passthrough,
+  correct port mapping (`8000`/`3000`), and the frontend build arg
+  `NEXT_PUBLIC_API_URL=http://localhost:8000` — this is deliberately the
+  *host*-reachable URL, not a compose service name, because
+  `NEXT_PUBLIC_*` values are inlined into the client bundle and fetched
+  from the user's browser, not from the frontend container. Validated as
+  syntactically correct YAML; not executed end-to-end (see caveat below).
+
+> **Still unverified end-to-end:** Docker remains unavailable in this
+> environment (confirmed again for Phase 7, both via a POSIX shell and
+> PowerShell). The fixes above address concrete bugs found through static
+> review of the Dockerfiles and build context, not a passing
+> `docker compose up --build` run. Local dev (`Setup & Run — local dev`
+> below) remains the verified path; treat the Docker path as reviewed and
+> corrected but not yet execution-tested.
+
 ## Project structure
 
 ```
@@ -373,10 +415,9 @@ docker compose up --build
 Then visit `http://localhost:3000` (frontend) and `http://localhost:8000/api/health`
 (backend). Requires a filled-in `.env` at the repo root.
 
-> **Note:** Docker is not installed in the environment this project was
-> scaffolded in, so the Docker path is written to match the local-dev setup
-> exactly (same env vars, same ports) but has not been run end-to-end here.
-> The local dev commands above are the verified path.
+> **Note:** Docker is not installed in this environment, so this path has
+> been statically reviewed and corrected (see Phase 7) but not run
+> end-to-end. The local dev commands above are the verified path.
 
 ## Environment variables
 
