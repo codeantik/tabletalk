@@ -60,7 +60,16 @@ def get_tables(session_id: str) -> TablesResponse:
 def query_session(session_id: str, body: QueryRequest) -> QueryResponse:
     session = get_session_manager().get_session(session_id)
     result = run_nl_query(session, get_settings(), body.question)
-    return QueryResponse(session_id=session_id, **result.__dict__)
+    return QueryResponse(
+        session_id=session_id,
+        sql_used=result.sql,
+        intent=result.intent,
+        text=result.text,
+        chart=result.chart,
+        table=result.table,
+        error=result.error,
+        row_limit_applied=result.row_limit_applied,
+    )
 
 
 @router.delete("/{session_id}", status_code=204)

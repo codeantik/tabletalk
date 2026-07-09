@@ -15,8 +15,10 @@ import sqlglot
 from sqlglot import exp
 
 from app.core.config import Settings
+from app.models.schemas import ChartResponse, TableResponse
 from app.services.csv_ingestion import list_tables
-from app.services.llm_client import generate_sql
+from app.services.llm_client import generate_sql, synthesize_summary
+from app.services.response_composer import compose
 from app.services.session_manager import SessionRecord
 
 _DIALECT = "duckdb"
@@ -29,9 +31,10 @@ class QueryValidationError(Exception):
 @dataclass
 class QueryResult:
     sql: str | None = None
-    columns: list[str] | None = None
-    rows: list[list] | None = None
-    explanation: str | None = None
+    intent: str | None = None
+    text: str | None = None
+    chart: ChartResponse | None = None
+    table: TableResponse | None = None
     error: str | None = None
     row_limit_applied: bool = False
 
@@ -103,28 +106,47 @@ def execute_with_timeout(
             raise TimeoutError(f"Query did not complete within {timeout_seconds}s") from None
 
 
+def _early_result(intent: str, sql: str | None, explanation: str) -> QueryResult | None:
+    """Short-circuit before validation/execution when the model declined the
+    question (intent='unsupported') or gave no SQL despite a supported
+    intent. `explanation` doubles as the user-facing refusal message."""
+    if intent == "unsupported":
+        return QueryResult(intent=intent, error=explanation or "I can't answer that from this data.")
+    if sql is None:
+        return QueryResult(intent=intent, error="Model did not provide SQL for a supported intent.")
+    return None
+
+
 def run_nl_query(session: SessionRecord, settings: Settings, question: str) -> QueryResult:
     """Generate, validate (with one self-correcting retry), and execute SQL
-    for `question`. Never raises -- validation and execution failures come
-    back as a QueryResult with `error` set."""
+    for `question`, then compose the result into a text/chart/table
+    response. Never raises -- validation, execution, and unsupported-intent
+    outcomes all come back as a QueryResult with `error` set."""
     allowed_tables = set(session.table_sources.keys())
     schema_context = build_schema_context(session)
 
-    sql, explanation = generate_sql(question, schema_context, settings)
+    sql, explanation, intent = generate_sql(question, schema_context, settings)
+    early = _early_result(intent, sql, explanation)
+    if early is not None:
+        return early
+
     try:
         stmt = validate_select_sql(sql, allowed_tables)
     except QueryValidationError as first_error:
+        sql, explanation, intent = generate_sql(
+            question,
+            schema_context,
+            settings,
+            previous_sql=sql,
+            previous_error=str(first_error),
+        )
+        early = _early_result(intent, sql, explanation)
+        if early is not None:
+            return early
         try:
-            sql, explanation = generate_sql(
-                question,
-                schema_context,
-                settings,
-                previous_sql=sql,
-                previous_error=str(first_error),
-            )
             stmt = validate_select_sql(sql, allowed_tables)
         except QueryValidationError as second_error:
-            return QueryResult(sql=sql, error=str(second_error))
+            return QueryResult(sql=sql, intent=intent, error=str(second_error))
 
     limited_stmt, row_limit_applied = apply_row_limit(stmt, settings.max_rows_returned)
     final_sql = limited_stmt.sql(dialect=_DIALECT)
@@ -134,12 +156,16 @@ def run_nl_query(session: SessionRecord, settings: Settings, question: str) -> Q
             session.conn, final_sql, settings.query_timeout_seconds
         )
     except Exception as exc:
-        return QueryResult(sql=final_sql, error=f"Query execution failed: {exc}")
+        return QueryResult(sql=final_sql, intent=intent, error=f"Query execution failed: {exc}")
+
+    composition = compose(intent, columns, rows)
+    text = synthesize_summary(question, intent, columns, rows, settings)
 
     return QueryResult(
         sql=final_sql,
-        columns=columns,
-        rows=rows,
-        explanation=explanation,
+        intent=intent,
+        text=text,
+        chart=composition.chart,
+        table=composition.table,
         row_limit_applied=row_limit_applied,
     )

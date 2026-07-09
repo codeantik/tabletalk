@@ -5,8 +5,9 @@ natural language, get back text / chart / table answers. See the full
 architecture decisions and phase plan in the project brief (not included in
 this repo).
 
-**Status:** Phase 2 complete — CSV ingestion (Phase 1) plus a single-turn
-NL→SQL query endpoint. The chat UI and multi-turn conversation land in
+**Status:** Phase 3 complete — CSV ingestion (Phase 1), a single-turn NL→SQL
+query endpoint (Phase 2), and deterministic response composition into
+text/chart/table (Phase 3). The chat UI and multi-turn conversation land in
 later phases.
 
 ## Phase 1: sessions & CSV ingestion
@@ -53,6 +54,51 @@ the clock ticking if nothing else touches the manager.
 - **Query timeout**: execution runs in a worker thread bounded by
   `QUERY_TIMEOUT_SECONDS`; a query that runs long is interrupted and comes
   back as an `error`, not a hung request.
+
+## Phase 3: response composition (text / chart / table)
+
+`POST /api/sessions/{session_id}/query` now returns a unified response
+shape: `{session_id, sql_used, intent, text, chart, table, error,
+row_limit_applied}`. `intent` and `chart`/`table` replace Phase 2's raw
+`columns`/`rows`/`explanation` fields — this is a breaking change to the
+Phase 2 contract, not an additive one.
+
+- **Intent classification** is produced by the same LLM call that generates
+  the SQL (`generate_sql_query` tool call gains an `intent` field: `trend`,
+  `comparison`, `single_value`, `lookup`, `distribution`, or `unsupported`).
+  No separate classification call.
+- **Deterministic text/chart/table mapping** (`app/services/response_composer.py`)
+  combines `intent` with the *actual* shape of the executed result — not the
+  LLM's word alone — so a mismatched intent still degrades to a sane
+  response instead of a bad chart:
+
+  | Result shape                                            | Intent                  | Response type |
+  |----------------------------------------------------------|--------------------------|----------------|
+  | 0 rows, or 1 row × 1 column                               | any                      | `text`         |
+  | 1 date column + ≥1 numeric column, >1 row                 | `trend`                  | `chart:line`   |
+  | 1 category column + 1 numeric column, 2–6 rows             | `distribution`           | `chart:pie`    |
+  | 1 category column + ≥1 numeric column, 2–50 rows           | `comparison`/`distribution` | `chart:bar` |
+  | anything else (including intent/shape mismatches)          | `lookup` / fallback      | `table`        |
+
+  Pie charts are used sparingly (≤6 categories, `distribution` intent only,
+  single metric); wider category counts fall back to a bar chart, and
+  anything beyond `BAR_MAX_CATEGORIES` (50) falls back to a table.
+- **Chart JSON contract**: `{type, data: [{x, series: [{name, value}]}]}` —
+  a shaped, minimal structure for the frontend charting library, not a raw
+  DataFrame dump.
+- **Result-aware NL summary**: after execution, a second LLM call
+  (`synthesize_summary`) is given the actual result rows (capped at 30 rows
+  to bound tokens) and produces a 1–3 sentence `text` summary grounded in
+  real values — distinct from Phase 2's `explanation`, which only describes
+  the query and runs before results exist. `text` is populated for every
+  successful response, including chart responses: charts always ship with a
+  caption (the "mix" default), never chart-only.
+- **`intent: unsupported` handling**: if the model determines a question
+  can't be answered from the uploaded data (off-topic, needs a write, needs
+  outside knowledge), SQL generation/validation/execution is skipped
+  entirely and the model's explanation is surfaced via the existing `error`
+  field — consistent with Phase 2's "couldn't answer → `error` field, still
+  a 200" contract, rather than a new response path.
 
 ## Project structure
 
@@ -120,11 +166,11 @@ limits, query timeout, CORS origin, frontend API URL).
   (Phase 2).
 - **pydantic-settings** — typed config loaded from `.env`.
 - **Next.js (App Router) + TypeScript** — chat UI, file upload, charts.
-- **OpenAI API** — NL→SQL generation via function calling for structured
-  `{sql, explanation}` output (Phase 2); NL response synthesis for the chat
-  UI comes in a later phase.
+- **OpenAI API** — NL→SQL generation plus intent classification via function
+  calling for structured `{sql, explanation, intent}` output (Phase 2/3),
+  and a second call for result-aware NL summaries (Phase 3).
 
-## Known limitations (Phase 2)
+## Known limitations (Phase 3)
 
 - Sessions live in backend process memory only — a restart drops all
   uploaded data, and there's no multi-worker/horizontal-scaling support.
@@ -132,5 +178,12 @@ limits, query timeout, CORS origin, frontend API URL).
 - `/query` is single-turn only — no conversation history or follow-up
   questions that reference a prior answer, and only one self-correcting
   retry on validation failure before surfacing an error.
+- Response composition only handles a single category/date column plus one
+  or more numeric columns per chart; multi-dimension breakdowns (e.g.
+  category × subcategory) fall back to a table rather than a grouped/stacked
+  chart.
+- The result-aware summary call sends at most 30 result rows to the LLM; for
+  larger result sets the summary is grounded in a sample, not the full set
+  (noted explicitly in the prompt sent to the model).
 - No chat UI yet — that's a later phase.
 - Docker path is unverified in this environment (see note above).

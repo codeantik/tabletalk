@@ -109,7 +109,10 @@ def test_query_happy_path_returns_rows(monkeypatch):
     monkeypatch.setattr(
         query_engine,
         "generate_sql",
-        lambda *args, **kwargs: ("SELECT * FROM orders ORDER BY a", "Lists every order."),
+        lambda *args, **kwargs: ("SELECT * FROM orders ORDER BY a", "Lists every order.", "lookup"),
+    )
+    monkeypatch.setattr(
+        query_engine, "synthesize_summary", lambda *args, **kwargs: "Two orders, a=1 and a=3."
     )
 
     response = client.post(f"/api/sessions/{session_id}/query", json={"question": "show me the orders"})
@@ -117,9 +120,12 @@ def test_query_happy_path_returns_rows(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["error"] is None
-    assert body["columns"] == ["a", "b"]
-    assert body["rows"] == [[1, 2], [3, 4]]
-    assert body["explanation"] == "Lists every order."
+    assert body["intent"] == "lookup"
+    assert body["sql_used"] == "SELECT * FROM orders ORDER BY a LIMIT 5000"
+    assert body["text"] == "Two orders, a=1 and a=3."
+    assert body["chart"] is None
+    assert body["table"]["columns"] == ["a", "b"]
+    assert body["table"]["rows"] == [[1, 2], [3, 4]]
 
 
 def test_query_retries_once_after_validation_failure(monkeypatch):
@@ -127,18 +133,19 @@ def test_query_retries_once_after_validation_failure(monkeypatch):
     _upload_orders(session_id)
     attempts = cycle(
         [
-            ("SELECT * FROM does_not_exist", "bad first attempt"),
-            ("SELECT * FROM orders ORDER BY a", "corrected attempt"),
+            ("SELECT * FROM does_not_exist", "bad first attempt", "lookup"),
+            ("SELECT * FROM orders ORDER BY a", "corrected attempt", "lookup"),
         ]
     )
     monkeypatch.setattr(query_engine, "generate_sql", lambda *args, **kwargs: next(attempts))
+    monkeypatch.setattr(query_engine, "synthesize_summary", lambda *args, **kwargs: "summary")
 
     response = client.post(f"/api/sessions/{session_id}/query", json={"question": "show me the orders"})
 
     assert response.status_code == 200
     body = response.json()
     assert body["error"] is None
-    assert body["rows"] == [[1, 2], [3, 4]]
+    assert body["table"]["rows"] == [[1, 2], [3, 4]]
 
 
 def test_query_returns_error_after_two_failed_validations(monkeypatch):
@@ -147,15 +154,35 @@ def test_query_returns_error_after_two_failed_validations(monkeypatch):
     monkeypatch.setattr(
         query_engine,
         "generate_sql",
-        lambda *args, **kwargs: ("SELECT * FROM does_not_exist", "still wrong"),
+        lambda *args, **kwargs: ("SELECT * FROM does_not_exist", "still wrong", "lookup"),
     )
 
     response = client.post(f"/api/sessions/{session_id}/query", json={"question": "show me the orders"})
 
     assert response.status_code == 200
     body = response.json()
-    assert body["rows"] is None
+    assert body["table"] is None
     assert "does_not_exist" in body["error"]
+
+
+def test_query_with_unsupported_intent_short_circuits(monkeypatch):
+    session_id = _create_session()
+    _upload_orders(session_id)
+    monkeypatch.setattr(
+        query_engine,
+        "generate_sql",
+        lambda *args, **kwargs: (None, "This question isn't about the uploaded data.", "unsupported"),
+    )
+
+    response = client.post(f"/api/sessions/{session_id}/query", json={"question": "what's the weather"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["intent"] == "unsupported"
+    assert body["sql_used"] is None
+    assert body["table"] is None
+    assert body["chart"] is None
+    assert body["error"] == "This question isn't about the uploaded data."
 
 
 def test_query_to_unknown_session_returns_404():

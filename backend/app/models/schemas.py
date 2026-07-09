@@ -35,11 +35,32 @@ class QueryRequest(BaseModel):
     question: str
 
 
+class ChartSeriesPoint(BaseModel):
+    name: str
+    value: float
+
+
+class ChartDataPoint(BaseModel):
+    x: str
+    series: list[ChartSeriesPoint]
+
+
+class ChartResponse(BaseModel):
+    type: str
+    data: list[ChartDataPoint]
+
+
+class TableResponse(BaseModel):
+    columns: list[str]
+    rows: list[list]
+
+
 class QueryResponse(BaseModel):
     session_id: str
-    sql: str | None = None
-    columns: list[str] | None = None
-    rows: list[list] | None = None
-    explanation: str | None = None
+    sql_used: str | None = None
+    intent: str | None = None
+    text: str | None = None
+    chart: ChartResponse | None = None
+    table: TableResponse | None = None
     error: str | None = None
     row_limit_applied: bool = False
