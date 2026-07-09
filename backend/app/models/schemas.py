@@ -31,7 +31,7 @@ class TablesResponse(BaseModel):
     tables: list[TableSchema]
 
 
-class QueryRequest(BaseModel):
+class MessageRequest(BaseModel):
     question: str
 
 
@@ -55,8 +55,10 @@ class TableResponse(BaseModel):
     rows: list[list]
 
 
-class QueryResponse(BaseModel):
+class MessageResponse(BaseModel):
     session_id: str
+    question: str
+    created_at: datetime
     sql_used: str | None = None
     intent: str | None = None
     text: str | None = None
@@ -64,3 +66,8 @@ class QueryResponse(BaseModel):
     table: TableResponse | None = None
     error: str | None = None
     row_limit_applied: bool = False
+
+
+class MessagesHistoryResponse(BaseModel):
+    session_id: str
+    messages: list[MessageResponse]

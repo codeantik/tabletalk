@@ -3,6 +3,7 @@ from itertools import cycle
 
 from fastapi.testclient import TestClient
 
+from app.core.config import get_settings
 from app.main import app
 from app.services import query_engine
 from app.services.session_manager import get_session_manager
@@ -103,7 +104,7 @@ def _upload_orders(session_id: str) -> None:
     assert response.status_code == 200
 
 
-def test_query_happy_path_returns_rows(monkeypatch):
+def test_message_happy_path_returns_rows(monkeypatch):
     session_id = _create_session()
     _upload_orders(session_id)
     monkeypatch.setattr(
@@ -115,10 +116,12 @@ def test_query_happy_path_returns_rows(monkeypatch):
         query_engine, "synthesize_summary", lambda *args, **kwargs: "Two orders, a=1 and a=3."
     )
 
-    response = client.post(f"/api/sessions/{session_id}/query", json={"question": "show me the orders"})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"question": "show me the orders"})
 
     assert response.status_code == 200
     body = response.json()
+    assert body["question"] == "show me the orders"
+    assert body["created_at"]
     assert body["error"] is None
     assert body["intent"] == "lookup"
     assert body["sql_used"] == "SELECT * FROM orders ORDER BY a LIMIT 5000"
@@ -128,7 +131,7 @@ def test_query_happy_path_returns_rows(monkeypatch):
     assert body["table"]["rows"] == [[1, 2], [3, 4]]
 
 
-def test_query_retries_once_after_validation_failure(monkeypatch):
+def test_message_retries_once_after_validation_failure(monkeypatch):
     session_id = _create_session()
     _upload_orders(session_id)
     attempts = cycle(
@@ -140,7 +143,7 @@ def test_query_retries_once_after_validation_failure(monkeypatch):
     monkeypatch.setattr(query_engine, "generate_sql", lambda *args, **kwargs: next(attempts))
     monkeypatch.setattr(query_engine, "synthesize_summary", lambda *args, **kwargs: "summary")
 
-    response = client.post(f"/api/sessions/{session_id}/query", json={"question": "show me the orders"})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"question": "show me the orders"})
 
     assert response.status_code == 200
     body = response.json()
@@ -148,7 +151,7 @@ def test_query_retries_once_after_validation_failure(monkeypatch):
     assert body["table"]["rows"] == [[1, 2], [3, 4]]
 
 
-def test_query_returns_error_after_two_failed_validations(monkeypatch):
+def test_message_returns_error_after_two_failed_validations(monkeypatch):
     session_id = _create_session()
     _upload_orders(session_id)
     monkeypatch.setattr(
@@ -157,7 +160,7 @@ def test_query_returns_error_after_two_failed_validations(monkeypatch):
         lambda *args, **kwargs: ("SELECT * FROM does_not_exist", "still wrong", "lookup"),
     )
 
-    response = client.post(f"/api/sessions/{session_id}/query", json={"question": "show me the orders"})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"question": "show me the orders"})
 
     assert response.status_code == 200
     body = response.json()
@@ -165,7 +168,7 @@ def test_query_returns_error_after_two_failed_validations(monkeypatch):
     assert "does_not_exist" in body["error"]
 
 
-def test_query_with_unsupported_intent_short_circuits(monkeypatch):
+def test_message_with_unsupported_intent_short_circuits(monkeypatch):
     session_id = _create_session()
     _upload_orders(session_id)
     monkeypatch.setattr(
@@ -174,7 +177,7 @@ def test_query_with_unsupported_intent_short_circuits(monkeypatch):
         lambda *args, **kwargs: (None, "This question isn't about the uploaded data.", "unsupported"),
     )
 
-    response = client.post(f"/api/sessions/{session_id}/query", json={"question": "what's the weather"})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"question": "what's the weather"})
 
     assert response.status_code == 200
     body = response.json()
@@ -185,6 +188,94 @@ def test_query_with_unsupported_intent_short_circuits(monkeypatch):
     assert body["error"] == "This question isn't about the uploaded data."
 
 
-def test_query_to_unknown_session_returns_404():
-    response = client.post("/api/sessions/does-not-exist/query", json={"question": "anything"})
+def test_message_to_unknown_session_returns_404():
+    response = client.post("/api/sessions/does-not-exist/messages", json={"question": "anything"})
     assert response.status_code == 404
+
+
+def test_get_messages_returns_stored_history(monkeypatch):
+    session_id = _create_session()
+    _upload_orders(session_id)
+    monkeypatch.setattr(
+        query_engine,
+        "generate_sql",
+        lambda *args, **kwargs: ("SELECT * FROM orders ORDER BY a", "explanation", "lookup"),
+    )
+    monkeypatch.setattr(query_engine, "synthesize_summary", lambda *args, **kwargs: "summary")
+
+    client.post(f"/api/sessions/{session_id}/messages", json={"question": "first question"})
+    client.post(f"/api/sessions/{session_id}/messages", json={"question": "second question"})
+
+    response = client.get(f"/api/sessions/{session_id}/messages")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_id"] == session_id
+    assert [m["question"] for m in body["messages"]] == ["first question", "second question"]
+
+
+def test_get_messages_for_unknown_session_returns_404():
+    response = client.get("/api/sessions/does-not-exist/messages")
+    assert response.status_code == 404
+
+
+def test_followup_question_receives_prior_turn_as_history(monkeypatch):
+    """Scripted multi-turn conversation from Phase 4's acceptance criteria:
+    each follow-up should see the previous turn's {question, sql, intent} as
+    context so the LLM can resolve 'break that down' / 'top 3' against it."""
+    session_id = _create_session()
+    _upload_orders(session_id)
+    seen_histories = []
+
+    def fake_generate_sql(question, schema_context, settings, *, history=None, **kwargs):
+        seen_histories.append([h.question for h in (history or [])])
+        return "SELECT * FROM orders ORDER BY a", "explanation", "lookup"
+
+    monkeypatch.setattr(query_engine, "generate_sql", fake_generate_sql)
+    monkeypatch.setattr(query_engine, "synthesize_summary", lambda *args, **kwargs: "summary")
+
+    client.post(f"/api/sessions/{session_id}/messages", json={"question": "What's total revenue in 2024?"})
+    client.post(f"/api/sessions/{session_id}/messages", json={"question": "Break that down by product category"})
+    client.post(f"/api/sessions/{session_id}/messages", json={"question": "Now just show me the top 3"})
+
+    assert seen_histories[0] == []
+    assert seen_histories[1] == ["What's total revenue in 2024?"]
+    assert seen_histories[2] == [
+        "What's total revenue in 2024?",
+        "Break that down by product category",
+    ]
+
+
+def test_message_rate_limited_returns_429(monkeypatch):
+    session_id = _create_session()
+    _upload_orders(session_id)
+    monkeypatch.setattr(
+        query_engine,
+        "generate_sql",
+        lambda *args, **kwargs: ("SELECT * FROM orders ORDER BY a", "explanation", "lookup"),
+    )
+    monkeypatch.setattr(query_engine, "synthesize_summary", lambda *args, **kwargs: "summary")
+
+    capacity = get_settings().rate_limit_capacity
+    for _ in range(capacity):
+        response = client.post(f"/api/sessions/{session_id}/messages", json={"question": "q"})
+        assert response.status_code == 200
+
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"question": "one too many"})
+    assert response.status_code == 429
+
+
+def test_message_llm_outage_returns_502(monkeypatch):
+    from app.services.llm_client import LLMServiceError
+
+    session_id = _create_session()
+    _upload_orders(session_id)
+
+    def raise_llm_error(*args, **kwargs):
+        raise LLMServiceError("OpenAI is unreachable")
+
+    monkeypatch.setattr(query_engine, "generate_sql", raise_llm_error)
+
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"question": "show me the orders"})
+
+    assert response.status_code == 502

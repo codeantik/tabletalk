@@ -7,11 +7,20 @@ back out.
 
 import json
 
+import openai
 from openai import OpenAI
 
 from app.core.config import Settings
+from app.services.conversation_store import ConversationTurn
 
 _TOOL_NAME = "generate_sql_query"
+
+
+class LLMServiceError(Exception):
+    """The LLM API itself failed (network error, timeout, auth, rate limit,
+    5xx) as opposed to responding with a malformed or unusable answer. Maps
+    to an HTTP-level failure (502) at the route, not a chat-level `error`
+    field -- there's no partial answer to show the user."""
 
 # Fixed intent enum the response_composer maps to a response shape. Kept in
 # sync with backend/app/services/response_composer.py's mapping table.
@@ -70,12 +79,30 @@ _SYSTEM_PROMPT = (
     "distribution, unsupported. If the question can't be answered from this "
     "data (unrelated to the tables, needs a write, or needs outside "
     "knowledge), set intent to 'unsupported' and skip the SQL.\n"
+    "- Some questions are follow-ups to a previous turn, shown below as "
+    "conversation history (most recent last). If the question uses words "
+    "like 'that', 'it', 'those', or asks to filter/break down/narrow the "
+    "previous result (e.g. 'now break it down by category', 'just the top "
+    "3'), treat the most recent turn's SQL as the base query and modify it "
+    "accordingly rather than starting over. If the question is unrelated to "
+    "the history, ignore the history and answer it fresh.\n"
     "- Always call the generate_sql_query tool with your answer."
 )
 
 
 def _client(settings: Settings) -> OpenAI:
-    return OpenAI(api_key=settings.openai_api_key)
+    return OpenAI(api_key=settings.openai_api_key, timeout=settings.llm_timeout_seconds)
+
+
+def _format_history(history: list[ConversationTurn] | None) -> str:
+    if not history:
+        return ""
+    lines = ["Conversation history (most recent last):"]
+    for i, turn in enumerate(history, start=1):
+        lines.append(
+            f"{i}. Question: {turn.question!r} | SQL: {turn.sql!r} | Intent: {turn.intent!r}"
+        )
+    return "\n".join(lines) + "\n\n"
 
 
 def generate_sql(
@@ -83,12 +110,16 @@ def generate_sql(
     schema_context: str,
     settings: Settings,
     *,
+    history: list[ConversationTurn] | None = None,
     previous_sql: str | None = None,
     previous_error: str | None = None,
 ) -> tuple[str | None, str, str]:
     """Ask the LLM for {sql, explanation, intent}. Raises RuntimeError if the
-    model doesn't return a well-formed tool call."""
-    user_content = f"Tables available:\n{schema_context}\n\nQuestion: {question}"
+    model responds without a well-formed tool call, or LLMServiceError if
+    the OpenAI API call itself fails (network/timeout/auth/rate-limit)."""
+    user_content = (
+        f"{_format_history(history)}Tables available:\n{schema_context}\n\nQuestion: {question}"
+    )
     if previous_sql is not None and previous_error is not None:
         user_content += (
             f"\n\nYour previous attempt was invalid.\n"
@@ -97,15 +128,18 @@ def generate_sql(
             f"Please correct it and try again."
         )
 
-    response = _client(settings).chat.completions.create(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        tools=_TOOLS,
-        tool_choice={"type": "function", "function": {"name": _TOOL_NAME}},
-    )
+    try:
+        response = _client(settings).chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            tools=_TOOLS,
+            tool_choice={"type": "function", "function": {"name": _TOOL_NAME}},
+        )
+    except openai.OpenAIError as exc:
+        raise LLMServiceError(f"SQL generation call failed: {exc}") from exc
 
     message = response.choices[0].message
     tool_calls = message.tool_calls or []
@@ -140,7 +174,10 @@ def synthesize_summary(
     settings: Settings,
 ) -> str:
     """Ask the LLM for a 1-3 sentence summary grounded in the executed
-    query's actual result rows (not re-derived from raw table data)."""
+    query's actual result rows (not re-derived from raw table data). Raises
+    LLMServiceError if the OpenAI API call itself fails -- the caller
+    decides whether to fail the whole request or fall back to a deterministic
+    caption, since by this point the SQL already executed successfully."""
     truncated = len(rows) > _SUMMARY_MAX_ROWS
     sample_rows = rows[:_SUMMARY_MAX_ROWS]
     result_text = json.dumps({"columns": columns, "rows": sample_rows})
@@ -151,11 +188,14 @@ def synthesize_summary(
         f"Question: {question}\nIntent: {intent}\nResult:\n{result_text}"
     )
 
-    response = _client(settings).chat.completions.create(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-    )
+    try:
+        response = _client(settings).chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+        )
+    except openai.OpenAIError as exc:
+        raise LLMServiceError(f"Summary synthesis call failed: {exc}") from exc
     return (response.choices[0].message.content or "").strip()

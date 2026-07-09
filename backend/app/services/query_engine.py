@@ -6,22 +6,27 @@ the session -- that check is the only thing standing between a hallucinated
 or malicious query and the rest of the session's data.
 """
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import duckdb
 import sqlglot
 from sqlglot import exp
 
 from app.core.config import Settings
+from app.core.logging import get_logger, log_event
 from app.models.schemas import ChartResponse, TableResponse
+from app.services.conversation_store import ConversationTurn, append_turn, recent_turns
 from app.services.csv_ingestion import list_tables
-from app.services.llm_client import generate_sql, synthesize_summary
+from app.services.llm_client import LLMServiceError, generate_sql, synthesize_summary
 from app.services.response_composer import compose
 from app.services.session_manager import SessionRecord
 
 _DIALECT = "duckdb"
+_logger = get_logger(__name__)
 
 
 class QueryValidationError(Exception):
@@ -37,6 +42,7 @@ class QueryResult:
     table: TableResponse | None = None
     error: str | None = None
     row_limit_applied: bool = False
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 def build_schema_context(session: SessionRecord) -> str:
@@ -117,36 +123,143 @@ def _early_result(intent: str, sql: str | None, explanation: str) -> QueryResult
     return None
 
 
-def run_nl_query(session: SessionRecord, settings: Settings, question: str) -> QueryResult:
-    """Generate, validate (with one self-correcting retry), and execute SQL
-    for `question`, then compose the result into a text/chart/table
-    response. Never raises -- validation, execution, and unsupported-intent
-    outcomes all come back as a QueryResult with `error` set."""
-    allowed_tables = set(session.table_sources.keys())
-    schema_context = build_schema_context(session)
+def _fallback_summary(rows: list[list]) -> str:
+    """Deterministic caption used when the NL-summary LLM call itself fails
+    (LLMServiceError) after the SQL already executed successfully -- the
+    query result is real and worth returning even if we can't narrate it,
+    and a chart response must never ship without some caption."""
+    if not rows:
+        return "The query returned no results."
+    return f"The query returned {len(rows)} row(s). (AI summary is temporarily unavailable.)"
 
-    sql, explanation, intent = generate_sql(question, schema_context, settings)
-    early = _early_result(intent, sql, explanation)
-    if early is not None:
-        return early
 
+def _generate_sql_logged(
+    question: str,
+    schema_context: str,
+    settings: Settings,
+    *,
+    history: list[ConversationTurn],
+    start: float,
+    previous_sql: str | None = None,
+    previous_error: str | None = None,
+) -> tuple[str | None, str, str]:
+    """Wraps llm_client.generate_sql to log+re-raise LLMServiceError (a total
+    LLM outage) before it propagates out of run_nl_query -- these calls never
+    produce a QueryResult/stored turn, but they should still show up in the
+    query log for observability."""
     try:
-        stmt = validate_select_sql(sql, allowed_tables)
-    except QueryValidationError as first_error:
-        sql, explanation, intent = generate_sql(
+        return generate_sql(
             question,
             schema_context,
             settings,
-            previous_sql=sql,
-            previous_error=str(first_error),
+            history=history,
+            previous_sql=previous_sql,
+            previous_error=previous_error,
         )
+    except LLMServiceError as exc:
+        log_event(
+            _logger,
+            "query_turn",
+            question=question,
+            sql=None,
+            intent=None,
+            validation="not_attempted",
+            execution="not_attempted",
+            error=str(exc),
+            latency_ms=round((time.monotonic() - start) * 1000, 1),
+        )
+        raise
+
+
+def run_nl_query(session: SessionRecord, settings: Settings, question: str) -> QueryResult:
+    """Generate, validate (with one self-correcting retry), and execute SQL
+    for `question`, then compose the result into a text/chart/table
+    response. Every graceful failure (unsupported intent, validation
+    failure, execution timeout, malformed model output) comes back as a
+    QueryResult with `error` set and is recorded in the session's
+    conversation history; an LLMServiceError (the LLM API itself is down)
+    propagates to the caller uncaught, since there's no answer -- graceful
+    or otherwise -- to store or return."""
+    start = time.monotonic()
+    allowed_tables = set(session.table_sources.keys())
+    schema_context = build_schema_context(session)
+    history = recent_turns(session, settings.history_turns_context)
+
+    def _finish(result: QueryResult, *, validation: str, execution: str) -> QueryResult:
+        log_event(
+            _logger,
+            "query_turn",
+            question=question,
+            sql=result.sql,
+            intent=result.intent,
+            validation=validation,
+            execution=execution,
+            error=result.error,
+            latency_ms=round((time.monotonic() - start) * 1000, 1),
+        )
+        append_turn(
+            session,
+            ConversationTurn(
+                question=question,
+                created_at=result.created_at,
+                sql=result.sql,
+                intent=result.intent,
+                text=result.text,
+                chart=result.chart,
+                table=result.table,
+                error=result.error,
+                row_limit_applied=result.row_limit_applied,
+            ),
+        )
+        return result
+
+    try:
+        sql, explanation, intent = _generate_sql_logged(
+            question, schema_context, settings, history=history, start=start
+        )
+    except RuntimeError as exc:
+        return _finish(
+            QueryResult(error=f"Could not generate a query for that question: {exc}"),
+            validation="not_attempted",
+            execution="not_attempted",
+        )
+
+    early = _early_result(intent, sql, explanation)
+    if early is not None:
+        return _finish(early, validation="skipped_unsupported", execution="skipped_unsupported")
+
+    try:
+        stmt = validate_select_sql(sql, allowed_tables)
+        validation_result = "passed"
+    except QueryValidationError as first_error:
+        try:
+            sql, explanation, intent = _generate_sql_logged(
+                question,
+                schema_context,
+                settings,
+                history=history,
+                start=start,
+                previous_sql=sql,
+                previous_error=str(first_error),
+            )
+        except RuntimeError as exc:
+            return _finish(
+                QueryResult(sql=sql, intent=intent, error=f"Could not correct the query: {exc}"),
+                validation="failed_retry_malformed",
+                execution="not_attempted",
+            )
         early = _early_result(intent, sql, explanation)
         if early is not None:
-            return early
+            return _finish(early, validation="retry_unsupported", execution="skipped_unsupported")
         try:
             stmt = validate_select_sql(sql, allowed_tables)
+            validation_result = "passed_after_retry"
         except QueryValidationError as second_error:
-            return QueryResult(sql=sql, intent=intent, error=str(second_error))
+            return _finish(
+                QueryResult(sql=sql, intent=intent, error=str(second_error)),
+                validation="failed_twice",
+                execution="not_attempted",
+            )
 
     limited_stmt, row_limit_applied = apply_row_limit(stmt, settings.max_rows_returned)
     final_sql = limited_stmt.sql(dialect=_DIALECT)
@@ -156,16 +269,28 @@ def run_nl_query(session: SessionRecord, settings: Settings, question: str) -> Q
             session.conn, final_sql, settings.query_timeout_seconds
         )
     except Exception as exc:
-        return QueryResult(sql=final_sql, intent=intent, error=f"Query execution failed: {exc}")
+        return _finish(
+            QueryResult(sql=final_sql, intent=intent, error=f"Query execution failed: {exc}"),
+            validation=validation_result,
+            execution="failed",
+        )
 
     composition = compose(intent, columns, rows)
-    text = synthesize_summary(question, intent, columns, rows, settings)
+    try:
+        text = synthesize_summary(question, intent, columns, rows, settings)
+    except LLMServiceError as exc:
+        log_event(_logger, "summary_fallback", question=question, error=str(exc))
+        text = _fallback_summary(rows)
 
-    return QueryResult(
-        sql=final_sql,
-        intent=intent,
-        text=text,
-        chart=composition.chart,
-        table=composition.table,
-        row_limit_applied=row_limit_applied,
+    return _finish(
+        QueryResult(
+            sql=final_sql,
+            intent=intent,
+            text=text,
+            chart=composition.chart,
+            table=composition.table,
+            row_limit_applied=row_limit_applied,
+        ),
+        validation=validation_result,
+        execution="succeeded",
     )

@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     max_upload_size_mb: int = 50
     max_rows_returned: int = 5000
     query_timeout_seconds: int = 10
+    llm_timeout_seconds: int = 20
+
+    # Multi-turn chat
+    history_turns_context: int = 3
+
+    # Rate limiting (per session, in-memory token bucket)
+    rate_limit_capacity: int = 10
+    rate_limit_refill_per_minute: int = 20
 
     # CORS
     frontend_origin: str = "http://localhost:3000"
