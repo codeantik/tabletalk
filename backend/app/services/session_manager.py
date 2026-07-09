@@ -6,6 +6,7 @@ swept out on the next manager call rather than via a background timer, which
 is sufficient for a PoC's request-driven lifecycle.
 """
 
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,16 @@ class SessionRecord:
     last_accessed_at: datetime
     table_sources: dict[str, str] = field(default_factory=dict)
     turns: list[ConversationTurn] = field(default_factory=list)
+    # A single DuckDB connection is not safe for concurrent use from
+    # multiple threads (confirmed empirically in Phase 6: concurrent
+    # `execute()` calls on the same connection silently returned wrong
+    # results, no exception raised). FastAPI runs sync route handlers in a
+    # thread pool, so two requests hitting the same session_id at once (a
+    # double-click, two open tabs) would otherwise race on `conn`. Every
+    # direct use of `conn` (ingestion, schema introspection, query
+    # execution) takes this lock first -- see csv_ingestion.py and
+    # query_engine.py.
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class SessionManager:

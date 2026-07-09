@@ -27,6 +27,12 @@ class Settings(BaseSettings):
 
     # Upload / query limits
     max_upload_size_mb: int = 50
+    # Above this size, ingestion skips the pandas parse and loads the CSV
+    # directly via DuckDB's native read_csv_auto instead (see
+    # csv_ingestion.py) -- pandas ingestion is measurably slower and holds a
+    # second in-memory copy of the data past this scale (Phase 6 load test:
+    # ~2-4x slower at 25-130MB, see README).
+    large_file_threshold_mb: int = 20
     max_rows_returned: int = 5000
     query_timeout_seconds: int = 10
     llm_timeout_seconds: int = 20

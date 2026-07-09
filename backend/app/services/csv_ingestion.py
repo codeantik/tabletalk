@@ -4,10 +4,18 @@ Ingestion is all-or-nothing per upload request: every file is validated and
 parsed first, and only if all of them succeed are tables created/replaced in
 the session's DuckDB connection. This keeps a failed batch from leaving the
 session in a half-updated state.
+
+Files at or below LARGE_FILE_THRESHOLD_MB are parsed with pandas (needed to
+clean column names before DuckDB ever sees them). Above that threshold,
+ingestion skips pandas entirely and loads via DuckDB's native read_csv_auto,
+renaming columns after load instead -- a Phase 6 load test measured pandas
+ingestion as ~2-4x slower at 25-130MB (see README).
 """
 
 import io
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 
 import duckdb
@@ -71,7 +79,17 @@ def dedupe_names(names: list[str]) -> list[str]:
     return result
 
 
-def _read_and_validate_csv(filename: str, content: bytes) -> pd.DataFrame:
+@dataclass
+class _ParsedCsv:
+    """A validated file ready to load: either a parsed pandas DataFrame
+    (small/medium files) or a path to a temp file DuckDB will read natively
+    (large files, above LARGE_FILE_THRESHOLD_MB -- see module docstring)."""
+
+    df: pd.DataFrame | None = None
+    native_path: str | None = None
+
+
+def _read_and_validate_csv(filename: str, content: bytes) -> _ParsedCsv:
     settings = get_settings()
     if not filename.lower().endswith(".csv"):
         raise CsvValidationError(filename, "Only .csv files are supported")
@@ -82,13 +100,41 @@ def _read_and_validate_csv(filename: str, content: bytes) -> pd.DataFrame:
         )
     if not content.strip():
         raise CsvValidationError(filename, "File is empty")
+
+    large_file_bytes = settings.large_file_threshold_mb * 1024 * 1024
+    if len(content) > large_file_bytes:
+        return _validate_native(filename, content)
+
     try:
         df = pd.read_csv(io.BytesIO(content))
     except Exception as exc:
         raise CsvValidationError(filename, f"Could not parse CSV: {exc}") from exc
     if df.shape[1] == 0:
         raise CsvValidationError(filename, "CSV has no columns")
-    return df
+    return _ParsedCsv(df=df)
+
+
+def _validate_native(filename: str, content: bytes) -> _ParsedCsv:
+    """Above the large-file threshold, skip the pandas parse entirely:
+    write to a temp file and let DuckDB's own CSV sniffer validate it (a
+    LIMIT 0 probe only samples the file for type/column detection, not a
+    full scan, so this stays cheap regardless of file size)."""
+    fd, path = tempfile.mkstemp(suffix=".csv")
+    with os.fdopen(fd, "wb") as f:
+        f.write(content)
+    probe_conn = duckdb.connect(":memory:")
+    try:
+        cursor = probe_conn.execute(f"SELECT * FROM read_csv_auto('{path}') LIMIT 0")
+        column_count = len(cursor.description)
+    except Exception as exc:
+        os.unlink(path)
+        raise CsvValidationError(filename, f"Could not parse CSV: {exc}") from exc
+    finally:
+        probe_conn.close()
+    if column_count == 0:
+        os.unlink(path)
+        raise CsvValidationError(filename, "CSV has no columns")
+    return _ParsedCsv(native_path=path)
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -106,6 +152,36 @@ def _ingest_dataframe(
         conn.execute(f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM _incoming')
     finally:
         conn.unregister("_incoming")
+    return _describe_table(conn, table_name, source_filename)
+
+
+def _ingest_native(
+    conn: duckdb.DuckDBPyConnection, table_name: str, native_path: str, source_filename: str
+) -> TableInfo:
+    """Load a large CSV straight into DuckDB via read_csv_auto, then rename
+    columns to the same normalized identifiers _clean_columns would have
+    produced -- column naming rules must match the pandas path exactly, just
+    applied after load instead of before (DuckDB does the parsing DuckDB
+    will also query, cutting out pandas + the Arrow hand-off pandas mode
+    pays for)."""
+    try:
+        conn.execute(
+            f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM read_csv_auto(?)',
+            [native_path],
+        )
+    finally:
+        os.unlink(native_path)
+    raw_columns = [row[0] for row in conn.execute(f'DESCRIBE "{table_name}"').fetchall()]
+    normalized = dedupe_names([normalize_identifier(c, "column") for c in raw_columns])
+    for old, new in zip(raw_columns, normalized):
+        if old != new:
+            conn.execute(f'ALTER TABLE "{table_name}" RENAME COLUMN "{old}" TO "{new}"')
+    return _describe_table(conn, table_name, source_filename)
+
+
+def _describe_table(
+    conn: duckdb.DuckDBPyConnection, table_name: str, source_filename: str
+) -> TableInfo:
     row_count = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
     columns = [
         ColumnInfo(name=row[0], type=row[1])
@@ -119,20 +195,21 @@ def _ingest_dataframe(
 def list_tables(session: SessionRecord) -> list[TableInfo]:
     """Describe every table currently loaded in a session, straight from DuckDB."""
     tables = []
-    for table_name, source_filename in session.table_sources.items():
-        row_count = session.conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
-        columns = [
-            ColumnInfo(name=row[0], type=row[1])
-            for row in session.conn.execute(f'DESCRIBE "{table_name}"').fetchall()
-        ]
-        tables.append(
-            TableInfo(
-                name=table_name,
-                source_filename=source_filename,
-                row_count=row_count,
-                columns=columns,
+    with session.lock:
+        for table_name, source_filename in session.table_sources.items():
+            row_count = session.conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+            columns = [
+                ColumnInfo(name=row[0], type=row[1])
+                for row in session.conn.execute(f'DESCRIBE "{table_name}"').fetchall()
+            ]
+            tables.append(
+                TableInfo(
+                    name=table_name,
+                    source_filename=source_filename,
+                    row_count=row_count,
+                    columns=columns,
+                )
             )
-        )
     return tables
 
 
@@ -144,17 +221,25 @@ def ingest_upload_batch(
     Raises HTTPException(400) listing every failing file if any file in the
     batch is invalid; nothing is written to the session in that case.
     """
-    parsed: list[tuple[str, pd.DataFrame]] = []
+    parsed: list[tuple[str, _ParsedCsv]] = []
     errors: list[dict[str, str]] = []
     for filename, content in files:
         try:
-            df = _read_and_validate_csv(filename, content)
+            parsed_csv = _read_and_validate_csv(filename, content)
         except CsvValidationError as exc:
             errors.append({"filename": exc.filename, "detail": exc.detail})
             continue
-        parsed.append((filename, _clean_columns(df)))
+        if parsed_csv.df is not None:
+            parsed_csv.df = _clean_columns(parsed_csv.df)
+        parsed.append((filename, parsed_csv))
 
     if errors:
+        # A later file in the batch may have failed validation after an
+        # earlier large file was already spooled to a temp file -- since
+        # the whole batch is rejected, nothing will consume it.
+        for _, parsed_csv in parsed:
+            if parsed_csv.native_path is not None:
+                os.unlink(parsed_csv.native_path)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"message": "One or more files failed validation", "errors": errors},
@@ -170,22 +255,26 @@ def ingest_upload_batch(
     used_table_names = set(session.table_sources.keys())
     claimed_filenames: set[str] = set()
     tables: list[TableInfo] = []
-    for filename, df in parsed:
-        if filename in table_name_by_filename and filename not in claimed_filenames:
-            table_name = table_name_by_filename[filename]
-        else:
-            stem = filename.rsplit(".", 1)[0]
-            base_name = normalize_identifier(stem, "table")
-            table_name = base_name
-            suffix = 2
-            while table_name in used_table_names:
-                table_name = f"{base_name}_{suffix}"
-                suffix += 1
-        claimed_filenames.add(filename)
-        used_table_names.add(table_name)
+    with session.lock:
+        for filename, parsed_csv in parsed:
+            if filename in table_name_by_filename and filename not in claimed_filenames:
+                table_name = table_name_by_filename[filename]
+            else:
+                stem = filename.rsplit(".", 1)[0]
+                base_name = normalize_identifier(stem, "table")
+                table_name = base_name
+                suffix = 2
+                while table_name in used_table_names:
+                    table_name = f"{base_name}_{suffix}"
+                    suffix += 1
+            claimed_filenames.add(filename)
+            used_table_names.add(table_name)
 
-        table_info = _ingest_dataframe(session.conn, table_name, df, filename)
-        session.table_sources[table_name] = filename
-        tables.append(table_info)
+            if parsed_csv.native_path is not None:
+                table_info = _ingest_native(session.conn, table_name, parsed_csv.native_path, filename)
+            else:
+                table_info = _ingest_dataframe(session.conn, table_name, parsed_csv.df, filename)
+            session.table_sources[table_name] = filename
+            tables.append(table_info)
 
     return tables

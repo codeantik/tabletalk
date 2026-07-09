@@ -132,6 +132,65 @@ def test_one_bad_file_in_batch_aborts_the_whole_batch():
     assert session.table_sources == {}
 
 
+def test_large_file_uses_native_ingestion_path(monkeypatch):
+    from app.core import config
+
+    config.get_settings.cache_clear()
+    monkeypatch.setenv("LARGE_FILE_THRESHOLD_MB", "0")
+    config.get_settings.cache_clear()
+    try:
+        session = make_session()
+        content = b"Customer Name,Total $\nAlice,10\nBob,20\n"
+
+        tables = ingest_upload_batch(session, [("Sales Data.csv", content)])
+
+        assert len(tables) == 1
+        table = tables[0]
+        assert table.name == "sales_data"
+        assert table.row_count == 2
+        assert [c.name for c in table.columns] == ["customer_name", "total"]
+        rows = session.conn.execute('SELECT * FROM "sales_data" ORDER BY customer_name').fetchall()
+        assert rows == [("Alice", 10), ("Bob", 20)]
+    finally:
+        config.get_settings.cache_clear()
+
+
+def test_large_unparseable_csv_rejected_without_leaking_temp_file(monkeypatch):
+    from app.core import config
+
+    config.get_settings.cache_clear()
+    monkeypatch.setenv("LARGE_FILE_THRESHOLD_MB", "0")
+    config.get_settings.cache_clear()
+    try:
+        session = make_session()
+        with pytest.raises(HTTPException) as exc_info:
+            ingest_upload_batch(session, [("bad.csv", b'"unterminated quote\nrow')])
+        assert exc_info.value.status_code == 400
+        assert session.table_sources == {}
+    finally:
+        config.get_settings.cache_clear()
+
+
+def test_native_path_batch_still_aborts_atomically_on_sibling_failure(monkeypatch):
+    """A large file that validates fine must not leave a table behind if
+    another file in the same batch fails validation."""
+    from app.core import config
+
+    config.get_settings.cache_clear()
+    monkeypatch.setenv("LARGE_FILE_THRESHOLD_MB", "0")
+    config.get_settings.cache_clear()
+    try:
+        session = make_session()
+        with pytest.raises(HTTPException):
+            ingest_upload_batch(
+                session,
+                [("good.csv", b"a,b\n1,2\n"), ("bad.txt", b"a,b\n1,2\n")],
+            )
+        assert session.table_sources == {}
+    finally:
+        config.get_settings.cache_clear()
+
+
 def test_list_tables_reflects_current_session_state():
     session = make_session()
     ingest_upload_batch(session, [("data.csv", b"a,b\n1,2\n")])

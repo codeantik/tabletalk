@@ -265,9 +265,10 @@ def run_nl_query(session: SessionRecord, settings: Settings, question: str) -> Q
     final_sql = limited_stmt.sql(dialect=_DIALECT)
 
     try:
-        columns, rows = execute_with_timeout(
-            session.conn, final_sql, settings.query_timeout_seconds
-        )
+        with session.lock:
+            columns, rows = execute_with_timeout(
+                session.conn, final_sql, settings.query_timeout_seconds
+            )
     except Exception as exc:
         return _finish(
             QueryResult(sql=final_sql, intent=intent, error=f"Query execution failed: {exc}"),
