@@ -16,3 +16,6 @@ frontend/.next/
 .DS_Store
 .vscode/
 .idea/
+
+# Raw sample data (not a deliverable)
+Online Shop 2024.zip
