@@ -70,6 +70,10 @@ _SYSTEM_PROMPT = (
     "You translate a user's natural-language question into a single SQL query "
     "against the tables described below, and classify the question's intent. Rules:\n"
     "- Use DuckDB SQL dialect.\n"
+    "- If a column used with a date function (strftime, date_trunc, extract, "
+    "date arithmetic) is typed VARCHAR rather than DATE/TIMESTAMP, wrap it in "
+    "CAST(column AS DATE) first -- CSV-sourced date columns are often stored "
+    "as VARCHAR.\n"
     "- Only ever produce a single SELECT statement (CTEs via WITH are fine, "
     "but the overall statement must be read-only).\n"
     "- Never use INSERT, UPDATE, DELETE, DROP, ALTER, ATTACH, COPY, or any "
@@ -180,7 +184,10 @@ def synthesize_summary(
     caption, since by this point the SQL already executed successfully."""
     truncated = len(rows) > _SUMMARY_MAX_ROWS
     sample_rows = rows[:_SUMMARY_MAX_ROWS]
-    result_text = json.dumps({"columns": columns, "rows": sample_rows})
+    # default=str covers row values json.dumps can't natively encode (date/
+    # datetime/Decimal, all common DuckDB result types) -- a string
+    # representation is all a natural-language summary prompt needs.
+    result_text = json.dumps({"columns": columns, "rows": sample_rows}, default=str)
     if truncated:
         result_text += f"\n(truncated: showing {_SUMMARY_MAX_ROWS} of {len(rows)} rows)"
 

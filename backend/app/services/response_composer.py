@@ -25,6 +25,7 @@ caption ("mix" is the default, per prompt.md, not an either/or).
 """
 
 import decimal
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
@@ -37,6 +38,14 @@ BAR_MAX_CATEGORIES = 50
 # Pie charts are used "sparingly" (prompt.md) -- only for a small, genuinely
 # part-of-a-whole distribution.
 PIE_MAX_CATEGORIES = 6
+
+# A trend query's natural GROUP BY column is often a formatted date/month
+# string (e.g. STRFTIME(col, '%Y-%m') -> "2024-01"), not a native DATE/
+# TIMESTAMP value -- DuckDB returns those as plain strings. Recognize the
+# common ISO-ish shapes so such a column is still classified as "date"
+# rather than falling back to a generic "category" (and losing the line
+# chart a trend intent should get).
+_DATE_STRING_RE = re.compile(r"^\d{4}-\d{2}(-\d{2})?([ T]\d{2}:\d{2}(:\d{2})?)?$")
 
 
 class ResponseType(str, Enum):
@@ -59,7 +68,9 @@ def _is_numeric(value: object) -> bool:
 
 
 def _is_datelike(value: object) -> bool:
-    return isinstance(value, (date, datetime))
+    if isinstance(value, (date, datetime)):
+        return True
+    return isinstance(value, str) and bool(_DATE_STRING_RE.match(value.strip()))
 
 
 def _column_kinds(columns: list[str], rows: list[list]) -> list[str]:
