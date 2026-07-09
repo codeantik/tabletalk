@@ -29,3 +29,17 @@ class UploadResponse(BaseModel):
 class TablesResponse(BaseModel):
     session_id: str
     tables: list[TableSchema]
+
+
+class QueryRequest(BaseModel):
+    question: str
+
+
+class QueryResponse(BaseModel):
+    session_id: str
+    sql: str | None = None
+    columns: list[str] | None = None
+    rows: list[list] | None = None
+    explanation: str | None = None
+    error: str | None = None
+    row_limit_applied: bool = False

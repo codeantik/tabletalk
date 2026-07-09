@@ -5,8 +5,9 @@ natural language, get back text / chart / table answers. See the full
 architecture decisions and phase plan in the project brief (not included in
 this repo).
 
-**Status:** Phase 1 complete — CSV ingestion into session-scoped, in-memory
-DuckDB. NL→SQL and the chat UI land in later phases.
+**Status:** Phase 2 complete — CSV ingestion (Phase 1) plus a single-turn
+NL→SQL query endpoint. The chat UI and multi-turn conversation land in
+later phases.
 
 ## Phase 1: sessions & CSV ingestion
 
@@ -27,6 +28,31 @@ Sessions idle for longer than `SESSION_TTL_MINUTES` are evicted lazily (on
 the next call into the session manager) rather than by a background timer —
 sufficient for a request-driven PoC, but a session won't be freed purely by
 the clock ticking if nothing else touches the manager.
+
+## Phase 2: NL→SQL queries
+
+- `POST /api/sessions/{session_id}/query` — body `{"question": "..."}`.
+  The question, plus the session's table/column schema, is sent to the LLM
+  (function-calling, forced tool call) to produce `{sql, explanation}`.
+  Always returns `200`; the response body is
+  `{session_id, sql, columns, rows, explanation, error, row_limit_applied}`,
+  with `error` set (and `columns`/`rows`/`explanation` left `null`) instead
+  of an HTTP error status when the query couldn't be answered.
+- **SQL safety**: every generated query is parsed with `sqlglot` before it
+  ever reaches DuckDB. Only a single, read-only `SELECT` (CTEs allowed) that
+  references tables already loaded into the session is permitted — no
+  `INSERT`/`UPDATE`/`DELETE`/`DROP`/multi-statement payloads, and no tables
+  from other sessions.
+- **One self-correcting retry**: if the first attempt fails validation, the
+  rejected SQL and the specific error are fed back to the LLM for a single
+  retry before giving up and returning the error contract.
+- **Row limiting**: `LIMIT` is injected (if absent) or capped (if too high)
+  to `MAX_ROWS_RETURNED` directly in the executed SQL, so the `sql` field in
+  the response always matches what actually ran; `row_limit_applied`
+  indicates whether that happened.
+- **Query timeout**: execution runs in a worker thread bounded by
+  `QUERY_TIMEOUT_SECONDS`; a query that runs long is interrupted and comes
+  back as an `error`, not a hung request.
 
 ## Project structure
 
@@ -85,22 +111,26 @@ limits, query timeout, CORS origin, frontend API URL).
 ## Libraries used & why (so far)
 
 - **FastAPI** — async-friendly, typed request/response models via Pydantic,
-  minimal boilerplate for the SQL-generation and chat endpoints coming in
-  later phases.
+  minimal boilerplate for the query and chat endpoints.
 - **DuckDB** — queries CSVs directly via `read_csv_auto` with full SQL,
   in-process and per-session; avoids a pandas-agent's code-execution surface
   and SQLite's manual schema/typing setup.
-- **sqlglot** — parses and validates LLM-generated SQL before execution
+- **sqlglot** — parses and validates LLM-generated SQL before execution: a
+  single read-only `SELECT` over known tables, or the query is rejected
   (Phase 2).
 - **pydantic-settings** — typed config loaded from `.env`.
 - **Next.js (App Router) + TypeScript** — chat UI, file upload, charts.
-- **OpenAI API** — NL→SQL generation and NL response synthesis, via
-  function calling for structured `{sql, intent, explanation}` output.
+- **OpenAI API** — NL→SQL generation via function calling for structured
+  `{sql, explanation}` output (Phase 2); NL response synthesis for the chat
+  UI comes in a later phase.
 
-## Known limitations (Phase 1)
+## Known limitations (Phase 2)
 
 - Sessions live in backend process memory only — a restart drops all
   uploaded data, and there's no multi-worker/horizontal-scaling support.
 - TTL eviction is lazy (swept on next session-manager call), not proactive.
-- No NL→SQL or chat yet — those are later phases.
+- `/query` is single-turn only — no conversation history or follow-up
+  questions that reference a prior answer, and only one self-correcting
+  retry on validation failure before surfacing an error.
+- No chat UI yet — that's a later phase.
 - Docker path is unverified in this environment (see note above).

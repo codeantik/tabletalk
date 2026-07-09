@@ -1,8 +1,10 @@
 from datetime import timedelta
+from itertools import cycle
 
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services import query_engine
 from app.services.session_manager import get_session_manager
 
 client = TestClient(app)
@@ -92,4 +94,70 @@ def test_expired_session_returns_404_on_next_request():
     record.last_accessed_at -= timedelta(minutes=manager._ttl.total_seconds() / 60 + 1)
 
     response = client.get(f"/api/sessions/{session_id}/tables")
+    assert response.status_code == 404
+
+
+def _upload_orders(session_id: str) -> None:
+    files = [("files", ("orders.csv", b"a,b\n1,2\n3,4\n", "text/csv"))]
+    response = client.post(f"/api/sessions/{session_id}/upload", files=files)
+    assert response.status_code == 200
+
+
+def test_query_happy_path_returns_rows(monkeypatch):
+    session_id = _create_session()
+    _upload_orders(session_id)
+    monkeypatch.setattr(
+        query_engine,
+        "generate_sql",
+        lambda *args, **kwargs: ("SELECT * FROM orders ORDER BY a", "Lists every order."),
+    )
+
+    response = client.post(f"/api/sessions/{session_id}/query", json={"question": "show me the orders"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["error"] is None
+    assert body["columns"] == ["a", "b"]
+    assert body["rows"] == [[1, 2], [3, 4]]
+    assert body["explanation"] == "Lists every order."
+
+
+def test_query_retries_once_after_validation_failure(monkeypatch):
+    session_id = _create_session()
+    _upload_orders(session_id)
+    attempts = cycle(
+        [
+            ("SELECT * FROM does_not_exist", "bad first attempt"),
+            ("SELECT * FROM orders ORDER BY a", "corrected attempt"),
+        ]
+    )
+    monkeypatch.setattr(query_engine, "generate_sql", lambda *args, **kwargs: next(attempts))
+
+    response = client.post(f"/api/sessions/{session_id}/query", json={"question": "show me the orders"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["error"] is None
+    assert body["rows"] == [[1, 2], [3, 4]]
+
+
+def test_query_returns_error_after_two_failed_validations(monkeypatch):
+    session_id = _create_session()
+    _upload_orders(session_id)
+    monkeypatch.setattr(
+        query_engine,
+        "generate_sql",
+        lambda *args, **kwargs: ("SELECT * FROM does_not_exist", "still wrong"),
+    )
+
+    response = client.post(f"/api/sessions/{session_id}/query", json={"question": "show me the orders"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["rows"] is None
+    assert "does_not_exist" in body["error"]
+
+
+def test_query_to_unknown_session_returns_404():
+    response = client.post("/api/sessions/does-not-exist/query", json={"question": "anything"})
     assert response.status_code == 404

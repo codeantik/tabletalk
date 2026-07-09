@@ -1,7 +1,17 @@
 from fastapi import APIRouter, File, UploadFile
 
-from app.models.schemas import ColumnSchema, SessionResponse, TablesResponse, TableSchema, UploadResponse
+from app.core.config import get_settings
+from app.models.schemas import (
+    ColumnSchema,
+    QueryRequest,
+    QueryResponse,
+    SessionResponse,
+    TablesResponse,
+    TableSchema,
+    UploadResponse,
+)
 from app.services.csv_ingestion import TableInfo, ingest_upload_batch, list_tables
+from app.services.query_engine import run_nl_query
 from app.services.session_manager import SessionRecord, get_session_manager
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -44,6 +54,13 @@ def get_tables(session_id: str) -> TablesResponse:
     session = get_session_manager().get_session(session_id)
     tables = list_tables(session)
     return TablesResponse(session_id=session_id, tables=[_to_table_schema(t) for t in tables])
+
+
+@router.post("/{session_id}/query", response_model=QueryResponse)
+def query_session(session_id: str, body: QueryRequest) -> QueryResponse:
+    session = get_session_manager().get_session(session_id)
+    result = run_nl_query(session, get_settings(), body.question)
+    return QueryResponse(session_id=session_id, **result.__dict__)
 
 
 @router.delete("/{session_id}", status_code=204)
