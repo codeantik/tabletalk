@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { Menu } from "lucide-react";
 import {
   ApiError,
   createSession,
@@ -11,9 +12,12 @@ import {
   type TableSchema,
 } from "@/lib/api";
 import { clearStoredSessionId, loadStoredSessionId, storeSessionId } from "@/lib/storage";
-import FileUpload from "@/components/FileUpload";
-import TablesSidebar from "@/components/TablesSidebar";
+import EmptyStateHero from "@/components/EmptyStateHero";
+import DataManifestRail from "@/components/DataManifestRail";
 import ChatPanel from "@/components/ChatPanel";
+import ThemeToggle from "@/components/ThemeToggle";
+import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 
 export default function Home() {
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -21,7 +25,6 @@ export default function Home() {
   const [messages, setMessages] = useState<MessageResponse[]>([]);
   const [pending, setPending] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
-  const [banner, setBanner] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -60,10 +63,17 @@ export default function Home() {
     };
   }, []);
 
+  function handleUploaded(newTables: TableSchema[]) {
+    setTables((prev) => {
+      const byName = new Map(prev.map((t) => [t.name, t]));
+      for (const t of newTables) byName.set(t.name, t);
+      return Array.from(byName.values());
+    });
+  }
+
   async function handleSend(question: string) {
     if (!sessionId) return;
     setPending(true);
-    setBanner(null);
     try {
       const response = await postMessage(sessionId, question);
       setMessages((prev) => [...prev, response]);
@@ -93,63 +103,62 @@ export default function Home() {
   if (bootError) {
     return (
       <div className="flex min-h-screen items-center justify-center px-6">
-        <p className="max-w-md text-center text-sm text-red-600 dark:text-red-400">
-          {bootError}
-        </p>
+        <p className="max-w-md text-center text-sm text-destructive">{bootError}</p>
       </div>
     );
   }
 
+  const hasTables = tables.length > 0;
+
   return (
-    <div className="flex min-h-screen flex-col bg-zinc-50 dark:bg-black">
-      <header className="border-b border-zinc-200 px-6 py-4 dark:border-zinc-800">
-        <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-50">
-          Table Talk
-        </h1>
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">
-          Upload CSVs and ask questions in plain English.
-        </p>
+    <div className="flex h-dvh flex-col overflow-hidden bg-background">
+      <header className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3 sm:px-6">
+        <div className="flex items-center gap-3">
+          {hasTables && (
+            <Sheet>
+              <SheetTrigger
+                render={
+                  <Button variant="outline" size="icon" className="md:hidden" aria-label="Open data manifest" />
+                }
+              >
+                <Menu className="size-4" />
+              </SheetTrigger>
+              <SheetContent side="left" className="w-full max-w-xs p-0">
+                <SheetTitle className="sr-only">Data manifest</SheetTitle>
+                {sessionId && (
+                  <DataManifestRail sessionId={sessionId} tables={tables} onUploaded={handleUploaded} />
+                )}
+              </SheetContent>
+            </Sheet>
+          )}
+          <div>
+            <h1 className="font-heading text-xl font-semibold text-foreground">Table Talk</h1>
+            <p className="hidden text-sm text-muted-foreground sm:block">
+              Upload CSVs and ask questions in plain English.
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <ThemeToggle />
+        </div>
       </header>
 
-      {banner && (
-        <div className="bg-amber-50 px-6 py-2 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-          {banner}
-        </div>
+      {!hasTables && sessionId && (
+        <EmptyStateHero sessionId={sessionId} onUploaded={handleUploaded} />
       )}
 
-      <main className="flex flex-1 flex-col md:flex-row">
-        <aside className="w-full shrink-0 border-b border-zinc-200 p-4 md:w-80 md:border-b-0 md:border-r dark:border-zinc-800">
-          <div className="flex flex-col gap-4">
+      {hasTables && (
+        <main className="flex min-h-0 flex-1 flex-col md:flex-row">
+          <aside className="hidden min-w-0 shrink-0 overflow-hidden border-r border-border md:flex md:w-64 lg:w-72 xl:w-80">
             {sessionId && (
-              <FileUpload
-                sessionId={sessionId}
-                onUploaded={(newTables) => {
-                  setTables((prev) => {
-                    const byName = new Map(prev.map((t) => [t.name, t]));
-                    for (const t of newTables) byName.set(t.name, t);
-                    return Array.from(byName.values());
-                  });
-                }}
-              />
+              <DataManifestRail sessionId={sessionId} tables={tables} onUploaded={handleUploaded} />
             )}
-            <div>
-              <h2 className="mb-2 text-xs font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
-                Loaded tables
-              </h2>
-              <TablesSidebar tables={tables} />
-            </div>
-          </div>
-        </aside>
-
-        <section className="flex-1">
-          <ChatPanel
-            messages={messages}
-            onSend={handleSend}
-            disabled={tables.length === 0 || !sessionId}
-            pending={pending}
-          />
-        </section>
-      </main>
+          </aside>
+          <section className="min-h-0 min-w-0 flex-1 overflow-hidden">
+            <ChatPanel messages={messages} onSend={handleSend} disabled={!sessionId} pending={pending} />
+          </section>
+        </main>
+      )}
     </div>
   );
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
+import { AlertCircle, CheckCircle2, UploadCloud } from "lucide-react";
 import { ApiError, uploadCsvFiles, type TableSchema } from "@/lib/api";
 
 const MAX_FILE_SIZE_MB = 50;
@@ -8,6 +9,7 @@ const MAX_FILE_SIZE_MB = 50;
 interface FileUploadProps {
   sessionId: string;
   onUploaded: (tables: TableSchema[]) => void;
+  variant?: "hero" | "compact";
 }
 
 function validateFiles(files: File[]): string | null {
@@ -23,7 +25,7 @@ function validateFiles(files: File[]): string | null {
   return null;
 }
 
-export default function FileUpload({ sessionId, onUploaded }: FileUploadProps) {
+export default function FileUpload({ sessionId, onUploaded, variant = "hero" }: FileUploadProps) {
   const [dragActive, setDragActive] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,6 +65,8 @@ export default function FileUpload({ sessionId, onUploaded }: FileUploadProps) {
     }
   }
 
+  const isHero = variant === "hero";
+
   return (
     <div className="flex flex-col gap-3">
       <div
@@ -77,10 +81,18 @@ export default function FileUpload({ sessionId, onUploaded }: FileUploadProps) {
           handleFiles(e.dataTransfer.files);
         }}
         onClick={() => inputRef.current?.click()}
-        className={`flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed px-6 py-8 text-center transition-colors ${
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") inputRef.current?.click();
+        }}
+        role="button"
+        tabIndex={0}
+        aria-label="Upload CSV files"
+        className={`group flex cursor-pointer flex-col items-center justify-center gap-2 rounded-md border-2 border-dashed text-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+          isHero ? "px-5 py-9 sm:px-8 sm:py-12" : "px-4 py-6"
+        } ${
           dragActive
-            ? "border-indigo-500 bg-indigo-50 dark:bg-indigo-950/40"
-            : "border-zinc-300 hover:border-indigo-400 dark:border-zinc-700"
+            ? "border-primary bg-primary/5"
+            : "border-border hover:border-primary/60 hover:bg-muted/40"
         }`}
       >
         <input
@@ -91,41 +103,49 @@ export default function FileUpload({ sessionId, onUploaded }: FileUploadProps) {
           className="hidden"
           onChange={(e) => handleFiles(e.target.files)}
         />
-        <span className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
+        <UploadCloud
+          className={`${isHero ? "size-9" : "size-6"} text-muted-foreground transition-colors group-hover:text-primary`}
+        />
+        <span className={`font-medium text-foreground ${isHero ? "text-base" : "text-sm"}`}>
           {uploading ? "Uploading…" : "Drop CSV files here, or click to browse"}
         </span>
-        <span className="text-xs text-zinc-500 dark:text-zinc-400">
-          Multiple files supported · up to {MAX_FILE_SIZE_MB}MB each
+        <span className="text-sm text-muted-foreground">
+          Multiple files supported &middot; up to {MAX_FILE_SIZE_MB}MB each
         </span>
       </div>
 
       {error && (
-        <div className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
-          {error}
-          {fileErrors && (
-            <ul className="mt-1 list-disc pl-4">
-              {fileErrors.map((fe) => (
-                <li key={fe.filename}>
-                  <span className="font-medium">{fe.filename}:</span> {fe.detail}
-                </li>
-              ))}
-            </ul>
-          )}
+        <div className="flex gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3.5 py-2.5 text-sm text-destructive">
+          <AlertCircle className="mt-0.5 size-4 shrink-0" />
+          <div>
+            {error}
+            {fileErrors && (
+              <ul className="mt-1 list-disc pl-4">
+                {fileErrors.map((fe) => (
+                  <li key={fe.filename}>
+                    <span className="font-medium">{fe.filename}:</span> {fe.detail}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </div>
       )}
 
       {lastUploaded && lastUploaded.length > 0 && (
-        <div className="rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200">
-          <p className="font-medium">Loaded {lastUploaded.length} file(s):</p>
-          <ul className="mt-1 space-y-0.5">
-            {lastUploaded.map((t) => (
-              <li key={t.name}>
-                {t.source_filename} &rarr;{" "}
-                <span className="font-mono">{t.name}</span> ({t.row_count.toLocaleString()} rows,{" "}
-                {t.columns.length} cols)
-              </li>
-            ))}
-          </ul>
+        <div className="flex gap-2 rounded-md border border-positive/30 bg-positive/10 px-3.5 py-2.5 text-sm text-positive-foreground dark:text-positive">
+          <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-positive" />
+          <div>
+            <p className="font-medium text-foreground">Loaded {lastUploaded.length} file(s)</p>
+            <ul className="mt-1 space-y-0.5 text-sm text-muted-foreground">
+              {lastUploaded.map((t) => (
+                <li key={t.name}>
+                  {t.source_filename} &rarr; <span className="font-mono">{t.name}</span> (
+                  {t.row_count.toLocaleString()} rows, {t.columns.length} cols)
+                </li>
+              ))}
+            </ul>
+          </div>
         </div>
       )}
     </div>

@@ -1,46 +1,57 @@
 "use client";
 
 import type { TableResponse } from "@/lib/api";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 interface TableViewProps {
   table: TableResponse;
 }
 
+function isNumeric(value: unknown): boolean {
+  return typeof value === "number";
+}
+
 export default function TableView({ table }: TableViewProps) {
   return (
-    <div className="max-h-80 overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
-      <table className="min-w-full text-left text-sm">
-        <thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-900">
-          <tr>
+    <div className="max-h-80 overflow-auto rounded-md border border-border">
+      <Table>
+        <TableHeader className="sticky top-0 z-10 bg-muted">
+          <TableRow className="hover:bg-transparent">
             {table.columns.map((col) => (
-              <th
-                key={col}
-                className="whitespace-nowrap px-3 py-2 font-medium text-zinc-600 dark:text-zinc-300"
-              >
+              <TableHead key={col} className="font-mono text-sm whitespace-nowrap text-muted-foreground">
                 {col}
-              </th>
+              </TableHead>
             ))}
-          </tr>
-        </thead>
-        <tbody>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
           {table.rows.map((row, i) => (
-            <tr
-              key={i}
-              className="border-t border-zinc-100 odd:bg-white even:bg-zinc-50 dark:border-zinc-800 dark:odd:bg-zinc-950 dark:even:bg-zinc-900"
-            >
+            <TableRow key={i}>
               {row.map((cell, j) => (
-                <td key={j} className="whitespace-nowrap px-3 py-1.5 text-zinc-700 dark:text-zinc-300">
+                <TableCell
+                  key={j}
+                  className={`whitespace-nowrap text-sm ${
+                    isNumeric(cell) ? "font-mono tabular-nums text-foreground" : "text-foreground"
+                  }`}
+                >
                   {cell === null ? (
-                    <span className="text-zinc-400 italic dark:text-zinc-600">null</span>
+                    <span className="font-mono text-muted-foreground italic">null</span>
                   ) : (
                     String(cell)
                   )}
-                </td>
+                </TableCell>
               ))}
-            </tr>
+            </TableRow>
           ))}
-        </tbody>
-      </table>
+        </TableBody>
+      </Table>
     </div>
   );
 }

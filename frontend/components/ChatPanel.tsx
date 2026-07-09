@@ -1,8 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { SendHorizontal } from "lucide-react";
 import type { MessageResponse } from "@/lib/api";
 import ChatMessage from "@/components/ChatMessage";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 
 interface ChatPanelProps {
   messages: MessageResponse[];
@@ -34,20 +38,21 @@ export default function ChatPanel({
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+      <div className="mx-auto w-full max-w-4xl flex-1 space-y-4 overflow-y-auto px-4 py-4 sm:px-6 lg:px-8">
         {messages.length === 0 && (
-          <p className="mt-8 text-center text-sm text-zinc-400 dark:text-zinc-500">
+          <p className="mt-8 text-center text-base text-muted-foreground">
             {disabled
               ? "Upload CSV files to start asking questions."
-              : "Ask a question about your data, e.g. \"What's total revenue in 2024?\""}
+              : 'Ask a question about your data, e.g. "What\'s total revenue in 2024?"'}
           </p>
         )}
         {messages.map((m, i) => (
           <ChatMessage key={i} message={m} />
         ))}
         {pending && (
-          <div className="mr-auto max-w-[80%] rounded-2xl rounded-bl-sm bg-zinc-100 px-4 py-3 text-sm text-zinc-400 dark:bg-zinc-900 dark:text-zinc-500">
-            Thinking…
+          <div className="flex flex-col gap-2 rounded-md border border-border border-l-2 border-l-accent bg-card px-4 py-3.5">
+            <Skeleton className="h-3.5 w-3/4" />
+            <Skeleton className="h-3.5 w-1/2" />
           </div>
         )}
         <div ref={bottomRef} />
@@ -55,25 +60,27 @@ export default function ChatPanel({
 
       <form
         onSubmit={handleSubmit}
-        className="flex items-center gap-2 border-t border-zinc-200 px-4 py-3 dark:border-zinc-800"
+        className="border-t border-border px-4 py-3 sm:px-6 lg:px-8"
       >
-        <input
-          type="text"
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          disabled={disabled || pending}
-          placeholder={
-            disabled ? "Upload data to begin…" : "Ask a question about your data…"
-          }
-          className="flex-1 rounded-full border border-zinc-300 bg-white px-4 py-2 text-sm outline-none focus:border-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-950"
-        />
-        <button
-          type="submit"
-          disabled={disabled || pending || !question.trim()}
-          className="rounded-full bg-indigo-600 px-5 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          Send
-        </button>
+        <div className="mx-auto flex w-full max-w-4xl items-center gap-2">
+          <Input
+            type="text"
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            disabled={disabled || pending}
+            placeholder={disabled ? "Upload data to begin…" : "Ask a question about your data…"}
+            className="h-11 flex-1 text-base"
+          />
+          <Button
+            type="submit"
+            disabled={disabled || pending || !question.trim()}
+            size="lg"
+            aria-label="Send question"
+          >
+            <SendHorizontal className="size-4" />
+            <span className="hidden sm:inline">Send</span>
+          </Button>
+        </div>
       </form>
     </div>
   );
