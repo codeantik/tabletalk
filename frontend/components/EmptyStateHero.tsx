@@ -22,8 +22,7 @@ export default function EmptyStateHero({ sessionId, onUploaded }: EmptyStateHero
             Talk to your data.
           </h1>
           <p className="text-base text-balance text-muted-foreground sm:text-lg">
-            Upload your customers, orders, order_items, products, payment, shipments,
-            reviews, and suppliers CSVs. We&apos;ll chart the joins and let you ask
+            Upload any set of related CSVs. We&apos;ll chart the joins and let you ask
             questions in plain English.
           </p>
         </div>

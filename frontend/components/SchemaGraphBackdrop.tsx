@@ -27,7 +27,7 @@ function StaticSchemaGraph({ dark }: { dark: boolean }) {
       viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
       className="h-full w-full"
       role="img"
-      aria-label="Schema diagram showing the eight loaded tables connected by their join keys"
+      aria-label="Ambient decorative diagram of connected data tables"
     >
       {SCHEMA_EDGES.map((edge) => {
         const from = positions.get(edge.from)!;
