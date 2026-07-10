@@ -228,10 +228,44 @@ def run_nl_query(session: SessionRecord, settings: Settings, question: str) -> Q
     if early is not None:
         return _finish(early, validation="skipped_unsupported", execution="skipped_unsupported")
 
-    try:
-        stmt = validate_select_sql(sql, allowed_tables)
-        validation_result = "passed"
-    except QueryValidationError as first_error:
+    # A single bounded retry covers *either* failure mode -- a validation
+    # rejection (bad statement shape/unknown table) or a DuckDB execution
+    # error (e.g. a GROUP BY/binder error sqlglot can't catch, since it only
+    # checks statement shape, not column-level semantics). Both feed the same
+    # error text back to the LLM once before giving up gracefully.
+    validation_result = "passed"
+    for attempt in range(2):
+        stage: str | None = None
+        try:
+            stmt = validate_select_sql(sql, allowed_tables)
+        except QueryValidationError as exc:
+            stage, error, retry_sql = "validation", exc, sql
+        else:
+            limited_stmt, row_limit_applied = apply_row_limit(stmt, settings.max_rows_returned)
+            final_sql = limited_stmt.sql(dialect=_DIALECT)
+            try:
+                with session.lock:
+                    columns, rows = execute_with_timeout(
+                        session.conn, final_sql, settings.query_timeout_seconds
+                    )
+            except Exception as exc:
+                stage, error, retry_sql = "execution", exc, final_sql
+            else:
+                break  # success -- fall through to response composition below
+
+        if attempt == 1:
+            if stage == "execution":
+                return _finish(
+                    QueryResult(sql=retry_sql, intent=intent, error=f"Query execution failed: {error}"),
+                    validation=validation_result,
+                    execution="failed_execution_twice",
+                )
+            return _finish(
+                QueryResult(sql=retry_sql, intent=intent, error=str(error)),
+                validation="failed_validation_twice",
+                execution="not_attempted",
+            )
+
         try:
             sql, explanation, intent = _generate_sql_logged(
                 question,
@@ -239,42 +273,19 @@ def run_nl_query(session: SessionRecord, settings: Settings, question: str) -> Q
                 settings,
                 history=history,
                 start=start,
-                previous_sql=sql,
-                previous_error=str(first_error),
+                previous_sql=retry_sql,
+                previous_error=str(error),
             )
-        except RuntimeError as exc:
+        except RuntimeError as retry_exc:
             return _finish(
-                QueryResult(sql=sql, intent=intent, error=f"Could not correct the query: {exc}"),
+                QueryResult(sql=retry_sql, intent=intent, error=f"Could not correct the query: {retry_exc}"),
                 validation="failed_retry_malformed",
                 execution="not_attempted",
             )
         early = _early_result(intent, sql, explanation)
         if early is not None:
             return _finish(early, validation="retry_unsupported", execution="skipped_unsupported")
-        try:
-            stmt = validate_select_sql(sql, allowed_tables)
-            validation_result = "passed_after_retry"
-        except QueryValidationError as second_error:
-            return _finish(
-                QueryResult(sql=sql, intent=intent, error=str(second_error)),
-                validation="failed_twice",
-                execution="not_attempted",
-            )
-
-    limited_stmt, row_limit_applied = apply_row_limit(stmt, settings.max_rows_returned)
-    final_sql = limited_stmt.sql(dialect=_DIALECT)
-
-    try:
-        with session.lock:
-            columns, rows = execute_with_timeout(
-                session.conn, final_sql, settings.query_timeout_seconds
-            )
-    except Exception as exc:
-        return _finish(
-            QueryResult(sql=final_sql, intent=intent, error=f"Query execution failed: {exc}"),
-            validation=validation_result,
-            execution="failed",
-        )
+        validation_result = "passed_after_retry"
 
     composition = compose(intent, columns, rows)
     try:

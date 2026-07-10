@@ -166,6 +166,64 @@ def test_run_nl_query_handles_malformed_model_response_gracefully(monkeypatch):
     assert len(session.turns) == 1
 
 
+def test_run_nl_query_retries_after_duckdb_execution_error(monkeypatch):
+    """A GROUP BY/binder error only DuckDB can catch (sqlglot only checks
+    statement shape) must trigger the same bounded retry as a validation
+    failure, not surface straight to the user."""
+    session = make_session()
+    ingest_upload_batch(
+        session, [("customers.csv", b"customer_id,first_name\n1,Ann\n2,Bob\n")]
+    )
+    attempts = []
+
+    def fake_generate_sql(question, schema_context, settings, *, history=None, previous_sql=None, previous_error=None, **kwargs):
+        attempts.append(previous_error)
+        if previous_error is None:
+            # Missing GROUP BY column -- passes sqlglot, fails at DuckDB.
+            return (
+                'SELECT first_name, count(*) FROM "customers" GROUP BY customer_id',
+                "explanation",
+                "lookup",
+            )
+        assert "GROUP BY" in previous_error or "Binder" in previous_error
+        return (
+            'SELECT first_name, count(*) FROM "customers" GROUP BY first_name',
+            "explanation",
+            "lookup",
+        )
+
+    monkeypatch.setattr(query_engine, "generate_sql", fake_generate_sql)
+    monkeypatch.setattr(query_engine, "synthesize_summary", lambda *args, **kwargs: "summary")
+
+    result = run_nl_query(session, _settings(), "count customers by first name")
+
+    assert len(attempts) == 2
+    assert result.error is None
+    assert result.sql is not None and "GROUP BY first_name" in result.sql
+
+
+def test_run_nl_query_reports_error_after_execution_fails_twice(monkeypatch):
+    session = make_session()
+    ingest_upload_batch(
+        session, [("customers.csv", b"customer_id,first_name\n1,Ann\n2,Bob\n")]
+    )
+
+    def always_bad_sql(question, schema_context, settings, *, history=None, previous_sql=None, previous_error=None, **kwargs):
+        return (
+            'SELECT first_name, count(*) FROM "customers" GROUP BY customer_id',
+            "explanation",
+            "lookup",
+        )
+
+    monkeypatch.setattr(query_engine, "generate_sql", always_bad_sql)
+
+    result = run_nl_query(session, _settings(), "count customers by first name")
+
+    assert result.error is not None
+    assert "Query execution failed" in result.error
+    assert len(session.turns) == 1
+
+
 def test_run_nl_query_falls_back_to_deterministic_summary_on_llm_outage(monkeypatch):
     session = make_session()
     ingest_upload_batch(session, [("orders.csv", b"a,b\n1,2\n3,4\n")])
