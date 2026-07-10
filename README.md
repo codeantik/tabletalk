@@ -160,6 +160,14 @@ load and persisted in `localStorage` across refreshes.
 
 **Backend tests:** `cd backend && .venv\Scripts\activate && pytest`
 
+**Manual testing:** [`tests.md`](tests.md) is a step-by-step walkthrough for
+exercising every core feature by hand — ingestion/data-quality reporting,
+NL→SQL generation, the bounded validation-*and*-execution retry, chart/table/
+text response composition, multi-turn follow-ups, and the Phase 6 edge-case
+checklist — using the sample CSVs in `data/`. Run it after the automated
+suite, since the automated suite catches regressions but not LLM output
+quality or cross-service UI wiring.
+
 ## Setup & Run — Docker
 
 ```
