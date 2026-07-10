@@ -98,6 +98,41 @@ requests. **Conversation history is explicit structured context**
    `generate_sql` call, which modifies the previous query
    (`ORDER BY revenue DESC LIMIT 3`) instead of starting fresh.
 
+## Data cleaning
+
+Applied per-column, after the column-name normalization above, in
+`app/services/data_cleaning.py` — deliberately conservative, since this is a
+data-*analysis* tool and silently altering ground truth would undermine the
+one thing it's supposed to get right:
+
+- **Missing values.** Common null-like sentinels (`N/A`, `null`, `-`, `""`,
+  `unknown`, ...) are normalized to real `NULL` so `COUNT`/`AVG`/`GROUP BY`
+  don't treat them as their own bogus category.
+- **Data types.** An object column is coerced to numeric or date **only** if
+  ≥95% of its non-null values parse successfully (with a minimum sample size
+  of 20, so a tiny column can't hit that bar by chance) — e.g. `"$1,200.00"`
+  strings become real numbers. Cells that fail to parse become `NULL` (never
+  a dropped row), counted in the missing-value report. This threshold, not
+  100%, is deliberate: real CSVs almost always have a stray dirty cell even
+  in a fundamentally numeric column, and requiring perfection would mean the
+  fix rarely fires; a lower bar risks miscoercing genuinely mixed columns
+  (e.g. alphanumeric IDs).
+- **Outliers.** Counted per numeric column via IQR (1.5×) and reported —
+  **never removed or altered**. Silently discarding a real answer (e.g. the
+  largest order) would be worse than leaving it in.
+
+The full report (`missing_count`, `missing_pct`, `outlier_count`,
+`coerced_from`) is computed once at ingest time and returned on every table
+in `UploadResponse`/`TablesResponse`, surfaced in the upload sidebar.
+
+This only applies on the pandas ingestion path (files below
+`LARGE_FILE_THRESHOLD_MB`). Large files loaded via native `read_csv_auto`
+skip the pandas-side coercion (same performance tradeoff as column-name
+cleaning — see below) and rely on DuckDB's own type sniffing instead; the
+missing-value and outlier report is still computed for them via SQL against
+the loaded table, it just reports sentinel strings as missing rather than
+having mutated them to `NULL` in place.
+
 ## Setup & Run — local dev
 
 Requires Python 3.11+ and Node 20+.
@@ -192,8 +227,8 @@ and DuckDB session memory (scales with concurrent sessions × loaded-table
 size — capacity planning is single-machine-bounded today, see limitations).
 
 **3. Edge cases & robustness.** The table below is backed by one pytest per
-row (`backend/tests/test_edge_cases.py`), part of a 92-test suite that
-already covers ingestion, query engine, response composition, conversation
+row (`backend/tests/test_edge_cases.py`), part of a 101-test suite that
+already covers ingestion, data cleaning, query engine, response composition, conversation
 store, concurrency, rate limiting, and the sessions API. **Missing: CI
 wiring** — no `.github/workflows/` exists, so the suite runs locally, not on
 push/PR. Adversarial testing (chat-input prompt injection, data-embedded
@@ -269,9 +304,11 @@ Found during hardening/end-to-end testing, not part of the original design:
   breakdowns fall back to a table. Summaries sample ≤30 rows for larger sets.
 - Docker path is unverified end-to-end in this environment.
 - Session identity is a `localStorage` key, not auth — no cross-device
-  session resume. Upload UI shows row counts/columns only, no
-  missing-value/outlier report.
-- No CI wiring yet — the pytest suite (92 tests) runs locally, not gated.
+  session resume.
+- Type coercion (see [Data cleaning](#data-cleaning)) only runs on the
+  pandas ingestion path; large files loaded via native `read_csv_auto` get a
+  missing/outlier report but not the coercion pass itself.
+- No CI wiring yet — the pytest suite (101 tests) runs locally, not gated.
 
 ## Bonus features implemented
 

@@ -23,6 +23,7 @@ import pandas as pd
 from fastapi import HTTPException, status
 
 from app.core.config import get_settings
+from app.services import data_cleaning
 from app.services.session_manager import SessionRecord
 
 _NON_IDENTIFIER_CHARS = re.compile(r"[^a-z0-9_]+")
@@ -87,6 +88,7 @@ class _ParsedCsv:
 
     df: pd.DataFrame | None = None
     native_path: str | None = None
+    coerced_from: dict[str, str] = field(default_factory=dict)
 
 
 def _read_and_validate_csv(filename: str, content: bytes) -> _ParsedCsv:
@@ -231,6 +233,7 @@ def ingest_upload_batch(
             continue
         if parsed_csv.df is not None:
             parsed_csv.df = _clean_columns(parsed_csv.df)
+            parsed_csv.df, parsed_csv.coerced_from = data_cleaning.clean_values(parsed_csv.df)
         parsed.append((filename, parsed_csv))
 
     if errors:
@@ -272,9 +275,14 @@ def ingest_upload_batch(
 
             if parsed_csv.native_path is not None:
                 table_info = _ingest_native(session.conn, table_name, parsed_csv.native_path, filename)
+                coerced_from: dict[str, str] = {}
             else:
                 table_info = _ingest_dataframe(session.conn, table_name, parsed_csv.df, filename)
+                coerced_from = parsed_csv.coerced_from
             session.table_sources[table_name] = filename
+            session.table_quality[table_name] = data_cleaning.compute_quality(
+                session.conn, table_name, table_info.columns, coerced_from
+            )
             tables.append(table_info)
 
     return tables

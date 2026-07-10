@@ -15,6 +15,7 @@ import duckdb
 from fastapi import HTTPException, status
 
 from app.services.conversation_store import ConversationTurn
+from app.services.data_cleaning import ColumnQuality
 
 
 @dataclass
@@ -24,6 +25,11 @@ class SessionRecord:
     created_at: datetime
     last_accessed_at: datetime
     table_sources: dict[str, str] = field(default_factory=dict)
+    # Per-table, per-column data-quality report (missing/outlier counts,
+    # coercion notes), computed once at ingest time -- see
+    # data_cleaning.compute_quality. Cached rather than recomputed on every
+    # GET /tables so it never touches the chat-query hot path.
+    table_quality: dict[str, dict[str, ColumnQuality]] = field(default_factory=dict)
     turns: list[ConversationTurn] = field(default_factory=list)
     # A single DuckDB connection is not safe for concurrent use from
     # multiple threads (confirmed empirically in Phase 6: concurrent

@@ -13,6 +13,7 @@ from app.models.schemas import (
 )
 from app.services.conversation_store import ConversationTurn
 from app.services.csv_ingestion import TableInfo, ingest_upload_batch, list_tables
+from app.services.data_cleaning import ColumnQuality
 from app.services.query_engine import run_nl_query
 from app.services.rate_limiter import RateLimitExceeded, get_rate_limiter
 from app.services.session_manager import SessionRecord, get_session_manager
@@ -20,12 +21,25 @@ from app.services.session_manager import SessionRecord, get_session_manager
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 
-def _to_table_schema(table: TableInfo) -> TableSchema:
+def _to_table_schema(table: TableInfo, quality: dict[str, ColumnQuality]) -> TableSchema:
+    columns = []
+    for col in table.columns:
+        q = quality.get(col.name)
+        columns.append(
+            ColumnSchema(
+                name=col.name,
+                type=col.type,
+                missing_count=q.missing_count if q else 0,
+                missing_pct=q.missing_pct if q else 0.0,
+                outlier_count=q.outlier_count if q else None,
+                coerced_from=q.coerced_from if q else None,
+            )
+        )
     return TableSchema(
         name=table.name,
         source_filename=table.source_filename,
         row_count=table.row_count,
-        columns=[ColumnSchema(name=col.name, type=col.type) for col in table.columns],
+        columns=columns,
     )
 
 
@@ -64,14 +78,20 @@ async def upload_csvs(session_id: str, files: list[UploadFile] = File(...)) -> U
     session = get_session_manager().get_session(session_id)
     file_contents = [(f.filename or "", await f.read()) for f in files]
     tables = ingest_upload_batch(session, file_contents)
-    return UploadResponse(session_id=session_id, tables=[_to_table_schema(t) for t in tables])
+    return UploadResponse(
+        session_id=session_id,
+        tables=[_to_table_schema(t, session.table_quality.get(t.name, {})) for t in tables],
+    )
 
 
 @router.get("/{session_id}/tables", response_model=TablesResponse)
 def get_tables(session_id: str) -> TablesResponse:
     session = get_session_manager().get_session(session_id)
     tables = list_tables(session)
-    return TablesResponse(session_id=session_id, tables=[_to_table_schema(t) for t in tables])
+    return TablesResponse(
+        session_id=session_id,
+        tables=[_to_table_schema(t, session.table_quality.get(t.name, {})) for t in tables],
+    )
 
 
 @router.post("/{session_id}/messages", response_model=MessageResponse)

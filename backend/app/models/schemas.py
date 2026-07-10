@@ -12,6 +12,10 @@ class SessionResponse(BaseModel):
 class ColumnSchema(BaseModel):
     name: str
     type: str
+    missing_count: int = 0
+    missing_pct: float = 0.0
+    outlier_count: int | None = None
+    coerced_from: str | None = None
 
 
 class TableSchema(BaseModel):

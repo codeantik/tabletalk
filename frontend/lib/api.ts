@@ -44,6 +44,10 @@ export interface SessionResponse {
 export interface ColumnSchema {
   name: string;
   type: string;
+  missing_count: number;
+  missing_pct: number;
+  outlier_count: number | null;
+  coerced_from: string | null;
 }
 
 export interface TableSchema {
