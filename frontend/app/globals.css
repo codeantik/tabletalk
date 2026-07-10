@@ -61,6 +61,7 @@
  * light (warm paper) and dark (charcoal) surfaces.
  */
 :root {
+  color-scheme: light;
   --background: #faf9f6;
   --foreground: #201e1a;
   --card: #fefdfa;
@@ -99,6 +100,7 @@
 }
 
 .dark {
+  color-scheme: dark;
   --background: #1c1b19;
   --foreground: #ece9e3;
   --card: #232220;
